@@ -31,4 +31,5 @@ jobs:
       - run: cargo build --release
       - name: Usage text
         shell: bash
-        run: ./target/release/pluto-viz --help 2>&1 | grep -q 'usage: pluto-viz'
+        run: |
+          ./target/release/pluto-viz --help 2>&1 | grep -q 'usage: pluto-viz'
