@@ -1,11 +1,10 @@
-//! JACK client that feeds the Pluto visualizer.
+//! Audio bridge for the Pluto visualiser.
 //!
-//! Two JACK inputs (auto-connected to the first physical capture ports unless
-//! `--connect` says otherwise) are mixed to mono and analysed ~60 times a second: the RMS
-//! level over the last 2048 samples, and the bass / mid / high band levels since the last
-//! frame from time-domain filters (exact band edges at any sample rate, one frame of
-//! latency; FFT bins at 96 kHz would put the whole bass band in three bins). The levels go
-//! out over a WebSocket. The same binary serves the page and the images over HTTP, so the
+//! Captures audio (JACK on Linux; on Windows and macOS the system audio API through cpal),
+//! mixes it to mono and analyses it ~60 times a second: the RMS level over the last 2048
+//! samples, and the bass / mid / high band levels since the last frame from time-domain
+//! filters (exact band edges at any sample rate, one frame of latency). The levels go out
+//! over a WebSocket. The same binary serves the page and the images over HTTP, so the
 //! browser needs nothing else.
 
 use std::net::TcpListener;
@@ -15,6 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const N: usize = 2048;
+/// Capture ring: ~0.7 s at 96 kHz, far more than the 17 ms the analysis drains per frame.
+const RING: usize = 1 << 16;
 
 static INDEX: &str = include_str!("../../index.html");
 static PLUTO: &[u8] = include_bytes!("../../pluto.jpg");
@@ -26,68 +27,108 @@ struct Args {
     port: u16,
     name: String,
     connect: Vec<String>,
+    device: Option<String>,
+    list_devices: bool,
 }
 
+#[cfg(target_os = "linux")]
+const SOURCE_HELP: &str = "\
+  --name     JACK client name (default pluto-viz)
+  --connect  JACK source port to feed in (repeat; 1st -> in_1, 2nd -> in_2).
+             Default: the first two physical capture ports.";
+#[cfg(target_os = "windows")]
+const SOURCE_HELP: &str = "\
+  --device   capture device, part of its name; an output device is recorded as loopback
+             (what it plays). Default: the default output device, i.e. the desktop audio.
+  --list-devices  list the capture and output devices";
+#[cfg(target_os = "macos")]
+const SOURCE_HELP: &str = "\
+  --device   capture device, part of its name. Default: the default input device. For
+             desktop audio route it through a loopback device such as BlackHole.
+  --list-devices  list the capture devices";
+
 fn usage() -> ! {
+    help(2)
+}
+
+fn help(code: i32) -> ! {
     eprintln!(
-        "usage: pluto-viz [--bind ADDR] [--port N] [--name JACK_NAME] [--connect PORT]...\n\
+        "usage: pluto-viz [--bind ADDR] [--port N] [source options]\n\
          \n  --bind     listen address (default 127.0.0.1)\
-         \n  --port     HTTP port; the WebSocket uses PORT+1 (default 8765)\
-         \n  --name     JACK client name (default pluto-viz)\
-         \n  --connect  JACK source port to feed in (repeat; 1st -> in_1, 2nd -> in_2).\
-         \n             Default: the first two physical capture ports."
+         \n  --port     HTTP port; the WebSocket uses PORT+1 (default 8765)\n  {SOURCE_HELP}"
     );
-    std::process::exit(2)
+    std::process::exit(code)
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { bind: "127.0.0.1".into(), port: 8765, name: "pluto-viz".into(), connect: vec![] };
+    let mut a = Args {
+        bind: "127.0.0.1".into(),
+        port: 8765,
+        name: "pluto-viz".into(),
+        connect: vec![],
+        device: None,
+        list_devices: false,
+    };
+    let jack = cfg!(target_os = "linux");
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_else(|| usage());
         match k.as_str() {
             "--bind" => a.bind = v(),
             "--port" => a.port = v().parse().unwrap_or_else(|_| usage()),
-            "--name" => a.name = v(),
-            "--connect" => a.connect.push(v()),
+            "--name" if jack => a.name = v(),
+            "--connect" if jack => a.connect.push(v()),
+            "--device" if !jack => a.device = Some(v()),
+            "--list-devices" if !jack => a.list_devices = true,
+            "-h" | "--help" => help(0),
             _ => usage(),
         }
     }
     a
 }
 
-type Clients = Arc<Mutex<Vec<Sender<Vec<u8>>>>>;
+/// A running capture: samples (mono) arrive in `rx`; dropping `_keep` stops it.
+struct Capture {
+    sr: u32,
+    rx: rtrb::Consumer<f32>,
+    _keep: Box<dyn std::any::Any>,
+}
 
-fn main() {
-    let args = parse_args();
+fn fail(msg: String) -> ! {
+    eprintln!("pluto-viz: {msg}");
+    std::process::exit(1)
+}
 
+#[cfg(target_os = "linux")]
+fn start_capture(args: &Args) -> Capture {
     let (client, _) = jack::Client::new(&args.name, jack::ClientOptions::NO_START_SERVER)
-        .unwrap_or_else(|e| {
-            eprintln!("pluto-viz: cannot reach a JACK server: {e}");
-            std::process::exit(1)
-        });
+        .unwrap_or_else(|e| fail(format!("cannot reach a JACK server: {e}")));
     let sr = client.sample_rate();
-    let in1 = client.register_port("in_1", jack::AudioIn::default()).expect("register in_1");
-    let in2 = client.register_port("in_2", jack::AudioIn::default()).expect("register in_2");
-    let dests = [in1.name().expect("port name"), in2.name().expect("port name")];
+    let in1 = client
+        .register_port("in_1", jack::AudioIn::default())
+        .expect("register in_1");
+    let in2 = client
+        .register_port("in_2", jack::AudioIn::default())
+        .expect("register in_2");
+    let dests = [
+        in1.name().expect("port name"),
+        in2.name().expect("port name"),
+    ];
 
-    // The process callback only copies samples into a lock-free ring buffer:
-    // no allocation, locks or syscalls on the audio thread.
-    let rb = jack::RingBuffer::new(1 << 18).expect("ring buffer");
-    let (mut reader, mut writer) = rb.into_reader_writer();
+    // The process callback only pushes samples into a lock-free ring: no allocation, locks
+    // or syscalls on the audio thread. When the ring is full, samples are dropped.
+    let (mut tx, rx) = rtrb::RingBuffer::new(RING);
     let process = jack::contrib::ClosureProcessHandler::new(
         move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
-            let (a, b) = (in1.as_slice(ps), in2.as_slice(ps));
-            for (x, y) in a.iter().zip(b) {
-                let s = 0.5 * (x + y);
-                if writer.space() >= 4 {
-                    writer.write_buffer(&s.to_le_bytes());
-                }
+            for (x, y) in in1.as_slice(ps).iter().zip(in2.as_slice(ps)) {
+                let _ = tx.push(0.5 * (x + y));
             }
             jack::Control::Continue
         },
     );
-    let active = client.activate_async((), process).expect("activate JACK client");
+    let active = client
+        .activate_async((), process)
+        .expect("activate JACK client");
 
     let sources: Vec<String> = if args.connect.is_empty() {
         active.as_client().ports(
@@ -105,17 +146,148 @@ fn main() {
         }
     }
     if sources.len() == 1 {
-        let _ = active.as_client().connect_ports_by_name(&sources[0], &dests[1]);
+        let _ = active
+            .as_client()
+            .connect_ports_by_name(&sources[0], &dests[1]);
     }
+    Capture {
+        sr,
+        rx,
+        _keep: Box::new(active),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_capture(args: &Args) -> Capture {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    // WASAPI records an output device as loopback: what the desktop plays.
+    let loopback = cfg!(target_os = "windows");
+    let host = cpal::default_host();
+    let name = |d: &cpal::Device| {
+        d.description()
+            .map(|x| x.name().to_owned())
+            .unwrap_or_default()
+    };
+    let inputs: Vec<cpal::Device> = host
+        .input_devices()
+        .map(|d| d.collect())
+        .unwrap_or_default();
+    let outputs: Vec<cpal::Device> = if loopback {
+        host.output_devices()
+            .map(|d| d.collect())
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+    if args.list_devices {
+        for d in &inputs {
+            println!("input   {}", name(d));
+        }
+        for d in &outputs {
+            println!("output  {}  (recorded as loopback)", name(d));
+        }
+        std::process::exit(0)
+    }
+
+    let (device, as_output) = match &args.device {
+        Some(want) => {
+            let want = want.to_lowercase();
+            let hit = |d: &&cpal::Device| name(d).to_lowercase().contains(&want);
+            if let Some(d) = inputs.iter().find(hit) {
+                (d.clone(), false)
+            } else if let Some(d) = outputs.iter().find(hit) {
+                (d.clone(), true)
+            } else {
+                fail(format!(
+                    "no device matching \"{want}\" (see --list-devices)"
+                ))
+            }
+        }
+        None if loopback => (
+            host.default_output_device()
+                .unwrap_or_else(|| fail("no default output device".into())),
+            true,
+        ),
+        None => (
+            host.default_input_device()
+                .unwrap_or_else(|| fail("no default input device".into())),
+            false,
+        ),
+    };
+    let supported = if as_output {
+        device.default_output_config()
+    } else {
+        device.default_input_config()
+    }
+    .unwrap_or_else(|e| fail(format!("{}: no usable format: {e}", name(&device))));
+    let sr = supported.sample_rate();
+    let ch = supported.channels().max(1) as usize;
+    eprintln!(
+        "pluto-viz: capturing {}{} ({ch} ch, {sr} Hz)",
+        name(&device),
+        if as_output { " (loopback)" } else { "" }
+    );
+
+    let (tx, rx) = rtrb::RingBuffer::new(RING);
+    let config: cpal::StreamConfig = supported.config();
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => build::<f32>(&device, &config, ch, tx),
+        cpal::SampleFormat::I16 => build::<i16>(&device, &config, ch, tx),
+        cpal::SampleFormat::I32 => build::<i32>(&device, &config, ch, tx),
+        cpal::SampleFormat::U16 => build::<u16>(&device, &config, ch, tx),
+        f => fail(format!("unsupported sample format {f:?}")),
+    }
+    .unwrap_or_else(|e| fail(format!("cannot open {}: {e}", name(&device))));
+    stream
+        .play()
+        .unwrap_or_else(|e| fail(format!("cannot start {}: {e}", name(&device))));
+    Capture {
+        sr,
+        rx,
+        _keep: Box::new(stream),
+    }
+}
+
+/// Input stream whose callback only mixes each frame to mono and pushes it into the ring:
+/// no allocation or locks on the audio thread. When the ring is full, samples are dropped.
+#[cfg(not(target_os = "linux"))]
+fn build<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    ch: usize,
+    mut tx: rtrb::Producer<f32>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    use cpal::traits::DeviceTrait;
+    let k = 1.0 / ch as f32;
+    device.build_input_stream::<T, _, _>(
+        *config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            for frame in data.chunks_exact(ch) {
+                let s: f32 = frame.iter().map(|x| x.to_sample::<f32>()).sum();
+                let _ = tx.push(s * k);
+            }
+        },
+        |e| eprintln!("pluto-viz: audio stream error: {e}"),
+        None,
+    )
+}
+
+type Clients = Arc<Mutex<Vec<Sender<Vec<u8>>>>>;
+
+fn main() {
+    let args = parse_args();
+    let mut cap = start_capture(&args);
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));
 
     let ws_clients = clients.clone();
     let ws_addr = format!("{}:{}", args.bind, args.port + 1);
-    let ws = TcpListener::bind(&ws_addr).unwrap_or_else(|e| {
-        eprintln!("pluto-viz: bind {ws_addr}: {e}");
-        std::process::exit(1)
-    });
+    let ws = TcpListener::bind(&ws_addr).unwrap_or_else(|e| fail(format!("bind {ws_addr}: {e}")));
     thread::spawn(move || {
         for stream in ws.incoming().flatten() {
             let (tx, rx) = mpsc::channel();
@@ -125,20 +297,20 @@ fn main() {
     });
 
     let http_addr = format!("{}:{}", args.bind, args.port);
-    let http = tiny_http::Server::http(&http_addr).unwrap_or_else(|e| {
-        eprintln!("pluto-viz: bind {http_addr}: {e}");
-        std::process::exit(1)
-    });
+    let http = tiny_http::Server::http(&http_addr)
+        .unwrap_or_else(|e| fail(format!("bind {http_addr}: {e}")));
     thread::spawn(move || serve_http(http));
-    eprintln!("pluto-viz: open http://{http_addr}/  (JACK {sr} Hz)");
+    eprintln!("pluto-viz: open http://{http_addr}/  ({} Hz)", cap.sr);
 
-    analyse_loop(&mut reader, sr, &clients);
-    drop(active);
+    // The capture stays on this thread (some backends' streams cannot move between threads).
+    analyse_loop(&mut cap.rx, cap.sr, &clients);
 }
 
 fn serve_ws(stream: std::net::TcpStream, rx: Receiver<Vec<u8>>) {
     let _ = stream.set_nodelay(true);
-    let Ok(mut ws) = tungstenite::accept(stream) else { return };
+    let Ok(mut ws) = tungstenite::accept(stream) else {
+        return;
+    };
     for msg in rx {
         if ws.send(tungstenite::Message::Binary(msg.into())).is_err() {
             return;
@@ -162,7 +334,11 @@ fn serve_http(server: tiny_http::Server) {
         let hdr = tiny_http::Header::from_bytes("Content-Type", ctype).expect("header");
         // The page and maps change with every build; never let the browser keep an old copy.
         let nc = tiny_http::Header::from_bytes("Cache-Control", "no-store").expect("header");
-        let _ = req.respond(tiny_http::Response::from_data(body).with_header(hdr).with_header(nc));
+        let _ = req.respond(
+            tiny_http::Response::from_data(body)
+                .with_header(hdr)
+                .with_header(nc),
+        );
     }
 }
 
@@ -184,7 +360,11 @@ impl Biquad {
         } else {
             [(1.0 - cs) / 2.0, 1.0 - cs, (1.0 - cs) / 2.0]
         };
-        Biquad { b: b.map(|x| x / a0), a: [-2.0 * cs / a0, (1.0 - alpha) / a0], z: [0.0; 2] }
+        Biquad {
+            b: b.map(|x| x / a0),
+            a: [-2.0 * cs / a0, (1.0 - alpha) / a0],
+            z: [0.0; 2],
+        }
     }
 
     fn run(&mut self, x: f32) -> f32 {
@@ -245,11 +425,10 @@ impl Bands {
 
 /// Message (20 bytes, little endian): sample rate (u32), RMS of the last N samples in dBFS
 /// (f32), then bass, mid and high band RMS since the previous message in dBFS (f32 each).
-fn analyse_loop(reader: &mut jack::RingBufferReader, sr: u32, clients: &Clients) {
+fn analyse_loop(rx: &mut rtrb::Consumer<f32>, sr: u32, clients: &Clients) {
     let mut hist = vec![0f32; N];
     let mut pos = 0usize;
     let mut bands = Bands::new(sr as f32);
-    let mut raw = vec![0u8; 4096];
     let mut msg = vec![0u8; 20];
     msg[..4].copy_from_slice(&sr.to_le_bytes());
     let period = Duration::from_micros(16_667);
@@ -264,15 +443,10 @@ fn analyse_loop(reader: &mut jack::RingBufferReader, sr: u32, clients: &Clients)
             next = now;
         }
 
-        let mut got = false;
-        loop {
-            let n = reader.read_buffer(&mut raw) / 4 * 4;
-            if n == 0 {
-                break;
-            }
-            got = true;
-            for c in raw[..n].chunks_exact(4) {
-                let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let n = rx.slots();
+        let got = n > 0;
+        if let Ok(chunk) = rx.read_chunk(n) {
+            for x in chunk {
                 hist[pos] = x;
                 pos = (pos + 1) % N;
                 bands.push(x);

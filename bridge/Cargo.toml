@@ -6,9 +6,16 @@ license = "MIT"
 description = "JACK bridge for the Pluto tholin-snow visualiser: level and band levels over WebSocket, serves the page"
 
 [dependencies]
-jack = "0.13"
+rtrb = "0.4"
 tungstenite = "0.26"
 tiny_http = "0.12"
+
+# Linux: JACK (PipeWire's JACK included). Windows / macOS: the system audio API via cpal.
+[target.'cfg(target_os = "linux")'.dependencies]
+jack = "0.13"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.18"
 
 [profile.release]
 opt-level = 3

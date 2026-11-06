@@ -5,8 +5,9 @@ tholin snow falling on it to the music. Silence leaves the planet as photographe
 music gets louder, red spreads out from Pluto's existing red ground across the ice, following
 the real terrain, and frost slowly buries it again when the music goes quiet.
 
-Audio comes from JACK. A small Rust bridge reads two JACK inputs, measures loudness and band
-levels, and serves the page; the page renders with WebGL2 in any current browser.
+A small Rust bridge captures the audio (JACK on Linux; the system audio on Windows and
+macOS), measures loudness and band levels, and serves the page; the page renders with WebGL2
+in any current browser.
 
 ## What the red is: tholins
 
@@ -67,33 +68,59 @@ settings and the input level on the scale the snowfall uses.
 
 ## Running
 
-You need a running JACK server (PipeWire's JACK works), Rust 1.85 or newer, and a browser
-with WebGL2 and float render targets (any current Chrome, Brave, Firefox or Edge).
-
-```sh
-./run.sh                                         # builds the bridge, starts it, opens the page
-./run.sh --connect system:capture_1 --connect system:capture_2
-```
-
-The bridge (`bridge/`, binary `pluto-viz`) embeds the page and images, so the single binary
-is all a machine needs:
+Ready-made binaries for Linux, Windows and macOS are on the
+[releases page](https://github.com/mkovero/pluto-viz/releases). The binary embeds the page
+and images, so it is all a machine needs: start it, then open `http://127.0.0.1:8765/` in a
+browser with WebGL2 and float render targets (any current Chrome, Brave, Firefox, Edge or
+Safari). The bridge only reads audio; it never outputs any.
 
 ```
-pluto-viz [--bind ADDR] [--port N] [--name JACK_NAME] [--connect PORT]...
+pluto-viz [--bind ADDR] [--port N] [source options]
   --bind     listen address (default 127.0.0.1)
   --port     HTTP port; the WebSocket uses PORT+1 (default 8765)
+```
+
+### Linux (JACK)
+
+Needs a running JACK server (PipeWire's JACK works).
+
+```
   --name     JACK client name (default pluto-viz)
   --connect  JACK source port to feed in (repeat; 1st -> in_1, 2nd -> in_2).
              Default: the first two physical capture ports.
 ```
-
-Open `http://127.0.0.1:8765/`. The bridge only reads audio; it never outputs any.
 
 To visualise what the desktop is playing through PipeWire, connect the bridge to the
 playback ports, e.g. `--connect PipeWire:playback_FL --connect PipeWire:playback_FR` (check
 the names with `jack_lsp`). `start-kiosk.sh` does that and opens the page in a Brave app
 window with its own profile, so a GPU reset in your everyday browser does not leave WebGL
 blocked there.
+
+### Windows
+
+By default the bridge records what the default output device plays (WASAPI loopback), so it
+follows whatever music the PC is playing. `--device NAME` picks another device by part of
+its name: an input (microphone, line in) or another output, recorded as loopback.
+`--list-devices` lists them.
+
+### macOS
+
+By default the bridge records the default input device. macOS has no built-in way to record
+what the Mac plays: install a loopback driver such as
+[BlackHole](https://github.com/ExistentialAudio/BlackHole), send the music to it (a
+Multi-Output Device in Audio MIDI Setup keeps it audible too), and start
+`pluto-viz --device BlackHole`. `--list-devices` lists the inputs. The first run asks for
+microphone permission for the terminal. The downloaded binary is not signed: allow it with
+`xattr -d com.apple.quarantine pluto-viz` or in System Settings → Privacy & Security.
+
+### From source
+
+Current stable Rust; on Linux the JACK headers (`libjack-jackd2-dev` or `pipewire-jack`).
+
+```sh
+./run.sh                                         # Linux: builds, starts, opens the page
+cargo run --release --manifest-path bridge/Cargo.toml -- --list-devices   # Windows / macOS
+```
 
 Test hooks: `?level=0.5` pins the loudness (no audio needed); `?warm=N` runs N snow steps
 on the first frame.
