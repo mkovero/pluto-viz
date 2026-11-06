@@ -37,9 +37,9 @@
 <div id="panel">
   <div class="box">
     <h1>Pluto, dancing</h1>
-    <div id="status">Connecting to the pluto-viz JACK bridge…</div>
+    <div id="status">Connecting to the pluto-viz bridge…</div>
     <div class="small">
-      Feed it with JACK: wire any source to <code>pluto-viz:in_1</code> / <code>in_2</code>.<br>
+      pluto-viz records what the computer plays; <code>pluto-viz --help</code> lists other sources.<br>
       F / double-click fullscreen · H hint · ↑/↓ ←/→ , . settings
     </div>
   </div>
@@ -244,7 +244,7 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
-// ---------- audio frames from the JACK bridge ----------
+// ---------- audio frames from the bridge ----------
 // Frame (20 bytes, LE): sample rate (u32), RMS of the mono mix in dBFS (f32), then the bass
 // (25-160 Hz), mid (160-2000 Hz) and high (2-12 kHz) band levels in dBFS (f32 each).
 let connected = false, rmsDb = -120, lastFrame = 0;
@@ -267,7 +267,7 @@ function connect() {
   };
   ws.onclose = () => {
     connected = false;
-    statusEl.textContent = 'JACK bridge not reachable — is pluto-viz running? Retrying…';
+    statusEl.textContent = 'Bridge not reachable — is pluto-viz running? Retrying…';
     panel.classList.remove('hidden');
     setTimeout(connect, 1000);
   };
@@ -334,9 +334,10 @@ function bind(prog, name, unit, tex) {
 }
 
 const t0 = performance.now();
-let last = t0;
-function frame(now) {
-  requestAnimationFrame(frame);
+let last = 0;
+function frame(now, manual) {
+  if (!manual) requestAnimationFrame(frame);
+  if (window.demoStep && !manual) return;
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   const t = (now - t0) / 1000;
   analyse(t, dt);
@@ -427,7 +428,7 @@ setInterval(() => {
   document.getElementById('osdFill').style.width = (frac * 100).toFixed(1) + '%';
   document.getElementById('osdIn').textContent = live
     ? `input ${rmsDb.toFixed(1)} dBFS RMS → ${(frac * 100).toFixed(0)} % of full`
-    : 'no input from the JACK bridge';
+    : 'no input from the bridge';
 }, 100);
 let idleT;
 addEventListener('mousemove', () => {
@@ -437,7 +438,32 @@ addEventListener('mousemove', () => {
 // Test hooks: ?level=0.5 pins the loudness (no audio needed); ?warm=N runs N sim steps
 // of 1/60 s on the first frame (settle the snow before a screenshot).
 { const v = new URLSearchParams(location.search).get('level');
-  if (v !== null) { const L = +v; analyse = () => { level = L; }; panel.classList.add('hidden'); } }
+  if (v !== null) { const L = +v; analyse = () => { level = L; }; panel.style.display = 'none'; } }
+// ?demo: a scripted swell for recording (quiet, a loud passage with kicks, quiet again) on
+// fixed 1/30 s frames that only advance through demoStep(n), so a slow renderer still
+// records smooth, repeatable motion. ?demo=SECONDS sets the loop length (default 30).
+{ const v = new URLSearchParams(location.search).get('demo');
+  if (v !== null) {
+    const T = +v || 30, DT = 1 / 30;
+    let vt = 0;
+    panel.style.display = 'none';
+    document.getElementById('hint').style.display = 'none';
+    analyse = (t, dt) => {
+      const x = (vt % T) / T;
+      // Raised-cosine swell over the middle of the loop, a little phrase movement on top.
+      const sw = x < 0.06 || x > 0.6 ? 0 : 0.5 - 0.5 * Math.cos(2 * Math.PI * (x - 0.06) / 0.54);
+      const target = Math.min(1, sw * (0.9 + 0.1 * Math.sin(vt * 2.1)));
+      level += (target - level) * Math.min(1, dt * (target > level ? 1.5 : 0.8));
+      const onBeat = sw > 0.4 && (vt % 0.5) < dt;
+      lvl.bass = sw > 0.4 ? Math.max(0, 1 - (vt % 0.5) * 4) : 0;
+      if (onBeat) { beat = 1; lastBeat = vt; }
+    };
+    let clock = 0;
+    window.demoStep = n => {
+      for (let i = 0; i < n; i++) { clock += DT * 1000; vt += DT; frame(clock, true); }
+      return vt;
+    };
+  } }
 </script>
 </body>
 </html>

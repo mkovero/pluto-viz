@@ -5,6 +5,10 @@ tholin snow falling on it to the music. Silence leaves the planet as photographe
 music gets louder, red spreads out from Pluto's existing red ground across the ice, following
 the real terrain, and frost slowly buries it again when the music goes quiet.
 
+![Tholin snow spreading over Pluto as a passage gets loud, then frost burying it again](docs/demo.gif)
+
+*A scripted loud passage, sped up (`?demo`; see below).*
+
 A small Rust bridge captures the audio (PipeWire or JACK on Linux, the system audio on
 Windows and macOS), measures loudness and band levels, and serves the page; the page renders with WebGL2
 in any current browser.
@@ -134,7 +138,8 @@ cargo run --release --manifest-path bridge/Cargo.toml -- --list-devices
 ```
 
 Test hooks: `?level=0.5` pins the loudness (no audio needed); `?warm=N` runs N snow steps
-on the first frame.
+on the first frame; `?demo` plays a scripted 30 s loud passage on fixed time steps, for
+recording.
 
 ## Rebuilding the images
 
@@ -146,6 +151,18 @@ tools/fetch_data.sh             # ~1 GB into data/
 python3 tools/fit_photo.py      # photo viewing geometry -> data/pia/fit.json
 python3 tools/build_view.py     # pluto.jpg, pluto_sim.png, pluto_view.json
 cargo build --release --manifest-path bridge/Cargo.toml   # embeds them
+```
+
+The README animation is recorded from `?demo` in headless Chromium (Node 22+, ffmpeg; any
+static server works, as the demo needs no bridge):
+
+```sh
+python3 -m http.server 8799 &
+PV_SETTINGS='{"pluto.ice":"0.8","pluto.flow":"2"}' \
+  node tools/record_demo.mjs "http://127.0.0.1:8799/?demo=30" /tmp/rec 225 4 480
+ffmpeg -framerate 15 -i /tmp/rec/f%04d.png -vf "scale=400:-1:flags=lanczos,split[a][b];\
+[a]palettegen=max_colors=128:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" \
+  -loop 0 docs/demo.gif
 ```
 
 `pluto_sim.png` holds, per simulation cell: R = the order in which the ground turns red,

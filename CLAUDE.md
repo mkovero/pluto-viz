@@ -41,7 +41,8 @@ Linux build deps: `libpipewire-0.3-dev libjack-jackd2-dev libasound2-dev libclan
   thickness grades dust (ice × stain^0.3, peach) to the photo's tholin red × photo texture, shaded by the
   photo's local luminance so lit/shadowed ground stays readable.
 - Loudness: −64…−8 dBFS mapped to 0…1 (56 dB), smoothing up `dt·1.5` / down `dt·0.8`, beat flurry `(1+beat)`.
-- Test hooks: `?level=X` pins loudness, `?warm=N` runs N sim steps on the first frame.
+- Test hooks: `?level=X` pins loudness, `?warm=N` runs N sim steps on the first frame, `?demo[=S]` scripted
+  swell on fixed 1/30 s steps advanced only by `demoStep(n)` (README GIF via `tools/record_demo.mjs`).
 
 ## Design decisions (settled with the operator — keep)
 - The red is tholin snow, never a liquid/flow; it grows from the photo's own red, never from scratch.
