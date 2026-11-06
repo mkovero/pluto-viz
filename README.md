@@ -5,8 +5,8 @@ tholin snow falling on it to the music. Silence leaves the planet as photographe
 music gets louder, red spreads out from Pluto's existing red ground across the ice, following
 the real terrain, and frost slowly buries it again when the music goes quiet.
 
-A small Rust bridge captures the audio (JACK on Linux; the system audio on Windows and
-macOS), measures loudness and band levels, and serves the page; the page renders with WebGL2
+A small Rust bridge captures the audio (PipeWire or JACK on Linux, the system audio on
+Windows and macOS), measures loudness and band levels, and serves the page; the page renders with WebGL2
 in any current browser.
 
 ## What the red is: tholins
@@ -80,21 +80,30 @@ pluto-viz [--bind ADDR] [--port N] [source options]
   --port     HTTP port; the WebSocket uses PORT+1 (default 8765)
 ```
 
-### Linux (JACK)
+### Linux
 
-Needs a running JACK server (PipeWire's JACK works).
+By default the bridge records what the default output plays, through PipeWire (any current
+desktop distribution), so it follows whatever music the desktop is playing.
 
 ```
+  --device   PipeWire device, part of its name; an output (sink) is recorded as what it
+             plays. Prefix in: or out: when a source and a sink share the name.
+  --list-devices  list the PipeWire devices
+```
+
+A sink that PipeWire bridges to a JACK server has no monitor to record; the bridge says so
+after a few seconds. Use JACK directly then:
+
+```
+  --jack     capture from JACK instead (implied by --name and --connect)
   --name     JACK client name (default pluto-viz)
   --connect  JACK source port to feed in (repeat; 1st -> in_1, 2nd -> in_2).
              Default: the first two physical capture ports.
 ```
 
-To visualise what the desktop is playing through PipeWire, connect the bridge to the
-playback ports, e.g. `--connect PipeWire:playback_FL --connect PipeWire:playback_FR` (check
-the names with `jack_lsp`). `start-kiosk.sh` does that and opens the page in a Brave app
-window with its own profile, so a GPU reset in your everyday browser does not leave WebGL
-blocked there.
+For example `--connect PipeWire:playback_FL --connect PipeWire:playback_FR` (check the names
+with `jack_lsp`). `start-kiosk.sh` does that and opens the page in a Brave app window with
+its own profile, so a GPU reset in your everyday browser does not leave WebGL blocked there.
 
 ### Windows
 
@@ -115,11 +124,13 @@ microphone permission for the terminal. The downloaded binary is not signed: all
 
 ### From source
 
-Current stable Rust; on Linux the JACK headers (`libjack-jackd2-dev` or `pipewire-jack`).
+Current stable Rust; on Linux the PipeWire and JACK headers and libclang (Debian/Ubuntu:
+`libpipewire-0.3-dev libjack-jackd2-dev libclang-dev`). The binary loads JACK at run time,
+so it starts on machines without it.
 
 ```sh
-./run.sh                                         # Linux: builds, starts, opens the page
-cargo run --release --manifest-path bridge/Cargo.toml -- --list-devices   # Windows / macOS
+./run.sh                     # Linux: builds, starts, opens the page; arguments go to pluto-viz
+cargo run --release --manifest-path bridge/Cargo.toml -- --list-devices
 ```
 
 Test hooks: `?level=0.5` pins the loudness (no audio needed); `?warm=N` runs N snow steps

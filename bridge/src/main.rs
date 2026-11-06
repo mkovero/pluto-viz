@@ -29,17 +29,24 @@ struct Args {
     connect: Vec<String>,
     device: Option<String>,
     list_devices: bool,
+    jack: bool,
 }
 
 #[cfg(target_os = "linux")]
 const SOURCE_HELP: &str = "\
+  --device   PipeWire device, part of its name; an output (sink) is recorded as what it
+             plays. Prefix in: or out: when a source and a sink share the name.
+             Default: the default output, i.e. the desktop audio.
+  --list-devices  list the PipeWire devices
+  --jack     capture from JACK instead (implied by --name and --connect)
   --name     JACK client name (default pluto-viz)
   --connect  JACK source port to feed in (repeat; 1st -> in_1, 2nd -> in_2).
              Default: the first two physical capture ports.";
 #[cfg(target_os = "windows")]
 const SOURCE_HELP: &str = "\
   --device   capture device, part of its name; an output device is recorded as loopback
-             (what it plays). Default: the default output device, i.e. the desktop audio.
+             (what it plays). Prefix in: or out: when an input and an output share the
+             name. Default: the default output device, i.e. the desktop audio.
   --list-devices  list the capture and output devices";
 #[cfg(target_os = "macos")]
 const SOURCE_HELP: &str = "\
@@ -68,21 +75,32 @@ fn parse_args() -> Args {
         connect: vec![],
         device: None,
         list_devices: false,
+        jack: false,
     };
-    let jack = cfg!(target_os = "linux");
+    let linux = cfg!(target_os = "linux");
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_else(|| usage());
         match k.as_str() {
             "--bind" => a.bind = v(),
             "--port" => a.port = v().parse().unwrap_or_else(|_| usage()),
-            "--name" if jack => a.name = v(),
-            "--connect" if jack => a.connect.push(v()),
-            "--device" if !jack => a.device = Some(v()),
-            "--list-devices" if !jack => a.list_devices = true,
+            "--jack" if linux => a.jack = true,
+            "--name" if linux => {
+                a.name = v();
+                a.jack = true;
+            }
+            "--connect" if linux => {
+                a.connect.push(v());
+                a.jack = true;
+            }
+            "--device" => a.device = Some(v()),
+            "--list-devices" => a.list_devices = true,
             "-h" | "--help" => help(0),
             _ => usage(),
         }
+    }
+    if a.jack && (a.device.is_some() || a.list_devices) {
+        fail("--device and --list-devices are for PipeWire, not JACK".into())
     }
     a
 }
@@ -99,8 +117,16 @@ fn fail(msg: String) -> ! {
     std::process::exit(1)
 }
 
-#[cfg(target_os = "linux")]
 fn start_capture(args: &Args) -> Capture {
+    #[cfg(target_os = "linux")]
+    if args.jack {
+        return start_jack(args);
+    }
+    start_cpal(args)
+}
+
+#[cfg(target_os = "linux")]
+fn start_jack(args: &Args) -> Capture {
     let (client, _) = jack::Client::new(&args.name, jack::ClientOptions::NO_START_SERVER)
         .unwrap_or_else(|e| fail(format!("cannot reach a JACK server: {e}")));
     let sr = client.sample_rate();
@@ -157,22 +183,18 @@ fn start_capture(args: &Args) -> Capture {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn start_capture(args: &Args) -> Capture {
+fn start_cpal(args: &Args) -> Capture {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-    // WASAPI records an output device as loopback: what the desktop plays.
-    let loopback = cfg!(target_os = "windows");
+    // WASAPI and PipeWire record an output device as what it plays (loopback / sink
+    // monitor), so by default the bridge follows the desktop audio. Core Audio cannot.
+    let loopback = !cfg!(target_os = "macos");
     let host = cpal::default_host();
     let name = |d: &cpal::Device| {
         d.description()
             .map(|x| x.name().to_owned())
             .unwrap_or_default()
     };
-    let inputs: Vec<cpal::Device> = host
-        .input_devices()
-        .map(|d| d.collect())
-        .unwrap_or_default();
     let outputs: Vec<cpal::Device> = if loopback {
         host.output_devices()
             .map(|d| d.collect())
@@ -180,6 +202,14 @@ fn start_capture(args: &Args) -> Capture {
     } else {
         vec![]
     };
+    // PipeWire lists each sink as an input too; keep it once, as an output.
+    let inputs: Vec<cpal::Device> = host
+        .input_devices()
+        .map(|d| {
+            d.filter(|i| !outputs.iter().any(|o| o.id().ok() == i.id().ok()))
+                .collect()
+        })
+        .unwrap_or_default();
     if args.list_devices {
         for d in &inputs {
             println!("input   {}", name(d));
@@ -192,16 +222,28 @@ fn start_capture(args: &Args) -> Capture {
 
     let (device, as_output) = match &args.device {
         Some(want) => {
+            // "in:" / "out:" pick the side when a capture and an output device share a name
+            // (PipeWire lists a card's source and sink under one name); otherwise the output
+            // wins, since recording what plays is the usual aim.
             let want = want.to_lowercase();
-            let hit = |d: &&cpal::Device| name(d).to_lowercase().contains(&want);
-            if let Some(d) = inputs.iter().find(hit) {
-                (d.clone(), false)
-            } else if let Some(d) = outputs.iter().find(hit) {
-                (d.clone(), true)
-            } else {
-                fail(format!(
+            let (side, want) = match want.split_once(':') {
+                Some(("in", w)) => (Some(false), w.trim()),
+                Some(("out", w)) => (Some(true), w.trim()),
+                _ => (None, want.as_str()),
+            };
+            let hit = |d: &&cpal::Device| name(d).to_lowercase().contains(want);
+            let out = (side != Some(false))
+                .then(|| outputs.iter().find(hit))
+                .flatten();
+            let inp = (side != Some(true))
+                .then(|| inputs.iter().find(hit))
+                .flatten();
+            match (out, inp) {
+                (Some(d), _) => (d.clone(), true),
+                (None, Some(d)) => (d.clone(), false),
+                _ => fail(format!(
                     "no device matching \"{want}\" (see --list-devices)"
-                ))
+                )),
             }
         }
         None if loopback => (
@@ -251,7 +293,6 @@ fn start_capture(args: &Args) -> Capture {
 
 /// Input stream whose callback only mixes each frame to mono and pushes it into the ring:
 /// no allocation or locks on the audio thread. When the ring is full, samples are dropped.
-#[cfg(not(target_os = "linux"))]
 fn build<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -433,6 +474,8 @@ fn analyse_loop(rx: &mut rtrb::Consumer<f32>, sr: u32, clients: &Clients) {
     msg[..4].copy_from_slice(&sr.to_le_bytes());
     let period = Duration::from_micros(16_667);
     let mut next = Instant::now();
+    let start = next;
+    let mut warned = false;
 
     loop {
         next += period;
@@ -453,8 +496,21 @@ fn analyse_loop(rx: &mut rtrb::Consumer<f32>, sr: u32, clients: &Clients) {
             }
         }
         if !got {
+            if !warned && start.elapsed() > Duration::from_secs(3) {
+                warned = true;
+                eprintln!(
+                    "pluto-viz: no audio is arriving. The device may not be recordable (a sink \
+                     bridged to JACK has no monitor): pick another with --device{}",
+                    if cfg!(target_os = "linux") {
+                        " or use --jack"
+                    } else {
+                        ""
+                    }
+                );
+            }
             continue;
         }
+        warned = true;
 
         let rms = (hist.iter().map(|x| x * x).sum::<f32>() / N as f32).sqrt();
         msg[4..8].copy_from_slice(&(20.0 * rms.max(1e-9).log10()).to_le_bytes());
