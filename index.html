@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pluto</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  body.idle, body.idle * { cursor: none !important; }
+  #panel {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    font: 15px/1.5 system-ui, sans-serif; color: #eee; background: rgba(0,0,0,.55);
+    transition: opacity .4s;
+  }
+  #panel.hidden { opacity: 0; pointer-events: none; }
+  #panel .box { background: rgba(20,8,8,.85); border: 1px solid #522; border-radius: 10px;
+    padding: 24px 28px; min-width: 340px; }
+  #panel h1 { margin: 0 0 12px; font-size: 22px; font-weight: 600; color: #f88; }
+  #panel .small { color: #a88; font-size: 13px; margin-top: 12px; }
+  #hint { position: fixed; left: 12px; bottom: 10px; font: 12px system-ui, sans-serif; color: #866;
+    transition: opacity .6s; }
+  body.idle #hint { opacity: 0; }
+  #osd { position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%);
+    font: 14px system-ui, sans-serif; color: #eee; background: rgba(15,6,4,.8);
+    border: 1px solid #522; border-radius: 8px; padding: 10px 16px; min-width: 300px;
+    opacity: 0; transition: opacity .5s; pointer-events: none; }
+  #osd.show { opacity: 1; }
+  #osd .bar { position: relative; height: 10px; background: #2a1410; border-radius: 3px; margin-top: 8px; }
+  #osd .fill { position: absolute; left: 0; top: 0; bottom: 0; background: #8a2a18; border-radius: 3px; }
+  #osd .val { color: #f9b; font-variant-numeric: tabular-nums; }
+  #osd .small { color: #a88; font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel">
+  <div class="box">
+    <h1>Pluto, dancing</h1>
+    <div id="status">Connecting to the pluto-viz JACK bridge…</div>
+    <div class="small">
+      Feed it with JACK: wire any source to <code>pluto-viz:in_1</code> / <code>in_2</code>.<br>
+      F / double-click fullscreen · H hint · ↑/↓ ←/→ , . settings
+    </div>
+  </div>
+</div>
+<div id="hint">F fullscreen · ↑/↓ (+/−) input sensitivity · ←/→ ([ ]) snowfall speed · , / . brightness · 0 reset all</div>
+<div id="osd">Input sensitivity <span class="val" id="osdSens"></span> · snowfall speed <span class="val" id="osdFlow"></span> · brightness <span class="val" id="osdIce"></span>
+  <div class="bar"><div class="fill" id="osdFill"></div></div>
+  <div class="small" id="osdIn"></div></div>
+
+<script>
+'use strict';
+// Pluto as New Horizons photographed it (PIA19952, tools/build_view.py), and tholin snow.
+// Tholins form in Pluto's haze, where sunlight breaks up methane and nitrogen; the reddish
+// particles settle out like a very fine snow. The ground stays red where nothing buries
+// them; fresh nitrogen frost keeps the heart white. Here sound is the snowfall: flakes land
+// in random specks, mostly next to the red ground already there (pluto_sim.png R: where it
+// settles, less on steep walls and bright fresh ice), so the red spreads outward from where
+// it is; louder reaches farther. In silence frost slowly buries it again.
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
+if (!gl || !gl.getExtension('EXT_color_buffer_float')) {
+  document.getElementById('status').textContent =
+    'WebGL2 with float render targets is not available (browser blocked the GPU?). Restart the browser.';
+  throw new Error('no WebGL2 float targets');
+}
+// A GPU reset loses every texture and the simulation; start over once the browser is back.
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); setTimeout(() => location.reload(), 2000); });
+const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+
+const VS = `#version 300 es
+in vec2 a; out vec2 vUV;
+void main(){ vUV = a*0.5+0.5; gl_Position = vec4(a,0.,1.); }`;
+
+const SNOW = `#version 300 es
+precision highp float;
+out vec4 o;
+uniform sampler2D uSim, uS;     // sim map (unused here), snow amount
+uniform float uFall, uBury, uDt;
+uniform int uSeed;
+// Integer hash: float hashes of cell coordinates leave a visible lattice in the flakes.
+float hash(ivec2 p, int s){
+  uint h = uint(p.x)*1973u + uint(p.y)*9277u + uint(s)*26699u;
+  h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+  return float(h) / 4294967295.0;
+}
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  float t = texelFetch(uS, p, 0).r;
+  // Each step one cell in five catches a flake (carrying 5× the mean): a fine grain that
+  // evens out as it piles.
+  float flake = hash(p, uSeed) < 0.2 ? 5.0 : 0.0;
+  t += uDt * uFall * flake;
+  t *= exp(-uBury * uDt);
+  o = vec4(t, 0, 0, 1);
+}`;
+
+const SHOW = `#version 300 es
+precision highp float;
+in vec2 vUV; out vec4 o;
+uniform sampler2D uImg, uSim, uS;
+uniform vec2 uRes;
+uniform float uIce;
+uniform vec3 uTholin, uStain;
+float hash(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p); vec2 u = f*f*(3.0-2.0*f);
+  return mix(mix(hash(i), hash(i+vec2(1,0)), u.x), mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), u.x), u.y);
+}
+void main(){
+  float asp = uRes.x/uRes.y;
+  vec2 q = (vUV - 0.5) * vec2(asp, 1.0) / min(asp, 1.0) / 0.92;   // disc fills 92 % of the short side
+  float r = length(q) * 2.0;
+  float aa = 2.0 / (min(uRes.x, uRes.y) * 0.92);
+  if (r > 1.0 + aa) { o = vec4(0, 0, 0, 1); return; }
+  vec2 u = q + 0.5;                 // sim grid: row 0 at the bottom (flipped on upload)
+  vec2 ui = vec2(u.x, 1.0 - u.y);   // pluto.jpg: row 0 at the top
+  vec3 ice = texture(uImg, ui).rgb * uIce;   // the photo, dimmed for a dark room
+
+  // Snow amount, softened over a couple of cells: a dusting, not single-pixel spatter.
+  vec2 px = 1.0 / vec2(textureSize(uS, 0));
+  float t = 0.2*texture(uS, u).r;
+  for (int i = 0; i < 8; i++) {
+    float a = float(i) * 0.785398 + 0.39;
+    t += 0.07*texture(uS, u + 1.2*px*vec2(cos(a), sin(a))).r + 0.03*texture(uS, u + 2.6*px*vec2(cos(a), sin(a))).r;
+  }
+  // Ground already red in the photo is left as photographed.
+  float pool = smoothstep(0.25, 0.75, texture(uSim, u).g);
+  // Covered ground takes the photo's own tholin red, keeping the ground's fine relief
+  // (brightness over its local mean) and the limb shading the red regions show in the photo.
+  vec3 c = texture(uImg, ui).rgb;
+  float L = dot(c, vec3(0.299, 0.587, 0.114));
+  float Lm = dot(textureLod(uImg, ui, 5.0).rgb, vec3(0.299, 0.587, 0.114));
+  float mu = sqrt(max(1.0 - r*r, 0.0));
+  // Broad albedo under the red too (square-root: bright ice reddens a bit lighter, as
+  // the photo's pinker red borders do); 0.55 is the clean ice's typical brightness.
+  float Lb = dot(textureLod(uImg, ui, 7.0).rgb, vec3(0.299, 0.587, 0.114));
+  // All the photo's light and dark below the broad scale stays under the red, so covered
+  // ground shows its terrain as Cthulhu does in the photo.
+  vec3 red = uTholin * clamp(L / max(Lb, 0.02), 0.3, 2.5) * sqrt(max(Lb, 0.05) / 0.55)
+           * pow(mu, 0.35) / 0.9 * uIce;
+  // Each spot turns at its own threshold, set by the photo's fine detail: dark hollows and
+  // crevices hold the tholins first, bright rims and ridges (fresh frost) last. The fronts
+  // then advance along the real terrain with crisp edges, as the red regions do in the
+  // photo, instead of a soft spray laid over it.
+  // Fractal raggedness (fixed on the ground): on smooth plains, where the photo has little
+  // detail, fronts break up like frost patch edges instead of following a smooth contour.
+  float det = clamp(L / max(Lm, 0.02), 0.5, 1.6);
+  float rag = 0.5*vnoise(ui*420.0) + 0.3*vnoise(ui*130.0 + 7.1) + 0.2*vnoise(ui*40.0 + 3.3);
+  float order = texture(uSim, u).r;
+  float thr = clamp(order + 0.10*(pow(det, 2.5) - 1.0) + 0.12*(rag - 0.5), 0.01, 1.0);
+  // Sputnik Planitia's nitrogen ice churns and renews its surface: snow only tints it.
+  float renew = texture(uSim, u).b;
+  float amt = smoothstep(thr - 0.08, thr + 0.08, t) * (1.0 - pool) * (1.0 - 0.75*renew);
+  // Thickness: how far the snow is past this spot's threshold. A thin dusting on ice is a
+  // light warm tint (the ice times a weak tholin/ice ratio); only a heavy layer goes to
+  // the photo's deep red. Patches then shade from peach at their fronts to red where the
+  // snow has piled up, not one opaque fill.
+  float thick = pow(clamp((t - thr) / 0.4, 0.0, 1.0), 0.8);
+  vec3 dust = ice * pow(uStain, vec3(0.3));
+  vec3 col = mix(ice, mix(dust, red, thick), amt);
+  col *= 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+  o = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+function compile(fsSrc) {
+  const mk = (type, src) => {
+    const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fsSrc));
+  gl.bindAttribLocation(p, 0, 'a');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const cache = {};
+  p.u = n => (n in cache) ? cache[n] : (cache[n] = gl.getUniformLocation(p, n));
+  return p;
+}
+const progSnow = compile(SNOW), progShow = compile(SHOW);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+function texParams(filter) {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter === gl.LINEAR_MIPMAP_LINEAR ? gl.LINEAR : filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+function loadImage(src) {
+  return new Promise((ok, err) => { const im = new Image(); im.onload = () => ok(im); im.onerror = err; im.src = src; });
+}
+
+let imgTex, simTex, N = 1024, view = { tholin_rgb: [0.25, 0.075, 0.05] };
+let S = [];
+function target(n) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, n, n, 0, gl.RGBA, gl.FLOAT, null);
+  texParams(floatLinear ? gl.LINEAR : gl.NEAREST);
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  return { t, f };
+}
+let ready = false;
+(async () => {
+  const [im, sim, meta] = await Promise.all([
+    loadImage('pluto.jpg'), loadImage('pluto_sim.png'), fetch('pluto_view.json').then(r => r.json())]);
+  view = meta;
+  imgTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, imgTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, im);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  texParams(gl.LINEAR_MIPMAP_LINEAR);
+  const an = gl.getExtension('EXT_texture_filter_anisotropic');
+  if (an) gl.texParameterf(gl.TEXTURE_2D, an.TEXTURE_MAX_ANISOTROPY_EXT, 4);
+
+  N = sim.width;
+  simTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, simTex);
+  gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB8, gl.RGB, gl.UNSIGNED_BYTE, sim);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  texParams(gl.LINEAR);
+  S = [target(N), target(N)];
+  ready = true;
+})().catch(e => { document.getElementById('status').textContent = 'Could not load the Pluto maps: ' + e; });
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(innerWidth*dpr); canvas.height = Math.floor(innerHeight*dpr);
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- audio frames from the JACK bridge ----------
+// Frame (20 bytes, LE): sample rate (u32), RMS of the mono mix in dBFS (f32), then the bass
+// (25-160 Hz), mid (160-2000 Hz) and high (2-12 kHz) band levels in dBFS (f32 each).
+let connected = false, rmsDb = -120, lastFrame = 0;
+const bandDb = { bass: -120, mid: -120, high: -120 };
+const panel = document.getElementById('panel');
+const statusEl = document.getElementById('status');
+function connect() {
+  const port = (parseInt(location.port, 10) || 80) + 1;
+  const ws = new WebSocket(`ws://${location.hostname}:${port}/`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { panel.classList.add('hidden'); };
+  ws.onmessage = e => {
+    const dv = new DataView(e.data);
+    rmsDb = dv.getFloat32(4, true);
+    bandDb.bass = dv.getFloat32(8, true);
+    bandDb.mid = dv.getFloat32(12, true);
+    bandDb.high = dv.getFloat32(16, true);
+    connected = true;
+    lastFrame = performance.now();
+  };
+  ws.onclose = () => {
+    connected = false;
+    statusEl.textContent = 'JACK bridge not reachable — is pluto-viz running? Retrying…';
+    panel.classList.remove('hidden');
+    setTimeout(connect, 1000);
+  };
+}
+connect();
+
+// Snowfall follows absolute loudness (silence lets frost bury it); the band levels adapt
+// to the material and only shape the motion.
+let sens = +(localStorage.getItem('pluto.sens') || 0);   // dB added to the input, +/- keys
+const LO_DB = -64, HI_DB = -8;   // 56 dB: a track's swings move the snow, not flip it
+let level = 0;
+const st = {};
+for (const k of ['bass', 'mid', 'high']) st[k] = { raw: 0, avg: 0.3, peak: 0.5, out: 0 };
+let prevBassRaw = 0, beat = 0, lastBeat = 0, kick = false;
+const lvl = { bass: 0, mid: 0, high: 0 };
+
+let analyse = function (t, dt) {
+  const live = connected && performance.now() - lastFrame < 500;
+  const db = live ? rmsDb + sens : -120;
+  const target = Math.min(1, Math.max(0, (db - LO_DB) / (HI_DB - LO_DB)));
+  // Level follows in ~0.7 s up, ~1.2 s down, whatever the snowfall speed: steps in the
+  // music become slopes in the snow.
+  level += (target - level) * Math.min(1, dt * (target > level ? 1.5 : 0.8));
+  if (!live) { lvl.bass = lvl.mid = lvl.high = 0; return; }
+  for (const k in st) {
+    // dBFS -> 0..1 over -90..-15 dB; light smoothing, as one frame of band RMS jitters.
+    const S = st[k];
+    S.raw += (Math.min(1, Math.max(0, (bandDb[k] + 90) / 75)) - S.raw) * Math.min(1, dt*30);
+    const raw = S.raw;
+    S.avg += (raw - S.avg) * Math.min(1, dt*0.5);
+    S.peak = Math.max(raw, S.peak - dt*0.05, S.avg + 0.05);
+    const floor = S.avg*0.85;
+    const norm = Math.min(1, Math.max(0, (raw - floor) / (S.peak - floor + 1e-3)));
+    S.out += (norm - S.out) * (norm > S.out ? Math.min(1, dt*30) : Math.min(1, dt*5));
+    lvl[k] = S.out * Math.min(1, level*4);
+    if (k === 'bass') {
+      const flux = raw - prevBassRaw; prevBassRaw = raw;
+      if (flux > 0.035 && norm > 0.55 && t - lastBeat > 0.2 && level > 0.02) { beat = 1; lastBeat = t; kick = true; }
+    }
+  }
+};
+
+// ---------- simulation + render ----------
+// Snow amount t per cell: grows with the fall rate × where it settles, buried at BURY per
+// second, so it settles at fall/BURY: louder snowfall stays visible farther from the red.
+// Snow settles at t = level. Ground turns red where t passes its order (pluto_sim.png R, the
+// rank in which it reddens: next to the red, patches, flat dark ground first), nudged by the
+// photo's fine detail (SHOW). So the covered share of the free ground tracks the loudness.
+const BURY = 1 / 8;                 // per second at fall rate ×1: ~8 s to settle or fade
+const FALL = BURY;                  // mean fall per second at full level (t units)
+let warm = +(new URLSearchParams(location.search).get('warm') || 0);
+let seed = 0;
+
+function pass(prog, out, setup) {
+  gl.useProgram(prog);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, out.f);
+  gl.viewport(0, 0, N, N);
+  setup(prog);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+function bind(prog, name, unit, tex) {
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(prog.u(name), unit);
+}
+
+const t0 = performance.now();
+let last = t0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const t = (now - t0) / 1000;
+  analyse(t, dt);
+  beat *= Math.exp(-dt*5);
+  if (!ready) return;
+
+  // Fall rate scales time for the whole snow: it falls, settles and is buried faster.
+  // Steps stay at most 1/60 s of snow time, so fast rates keep the fine grain.
+  const span = dt * flowRate;
+  let steps = Math.min(16, Math.max(1, Math.ceil(span * 60))), sdt = span / steps;
+  if (warm > 0) { steps = warm; sdt = 1 / 60; warm = 0; }
+  // Kicks bring a flurry over the whole fall (beat decays in ~0.2 s), never a local blob.
+  kick = false;
+  const fall = FALL * level * (0.75 + 0.5*lvl.bass) * (1 + beat);
+  for (let i = 0; i < steps; i++) {
+    pass(progSnow, S[1], p => {
+      bind(p, 'uSim', 0, simTex); bind(p, 'uS', 1, S[0].t);
+      gl.uniform1f(p.u('uFall'), fall); gl.uniform1f(p.u('uBury'), BURY);
+      gl.uniform1f(p.u('uDt'), sdt); gl.uniform1i(p.u('uSeed'), seed = (seed + 1) % 1000003);
+    });
+    S.reverse();
+  }
+
+  gl.useProgram(progShow);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  bind(progShow, 'uImg', 0, imgTex); bind(progShow, 'uSim', 1, simTex); bind(progShow, 'uS', 2, S[0].t);
+  gl.uniform2f(progShow.u('uRes'), canvas.width, canvas.height);
+  gl.uniform1f(progShow.u('uIce'), iceBright);
+  gl.uniform3fv(progShow.u('uTholin'), view.tholin_rgb);
+  gl.uniform3fv(progShow.u('uStain'), view.stain_rgb);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+requestAnimationFrame(frame);
+
+// ---------- UI ----------
+function toggleFs() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+canvas.addEventListener('dblclick', toggleFs);
+addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'F') toggleFs();
+  else if (e.key === 'h' || e.key === 'H') { const h = document.getElementById('hint'); h.hidden = !h.hidden; }
+  else if (e.key === '+' || e.key === '=' || e.key === 'ArrowUp') setSens(sens + 3);
+  else if (e.key === '-' || e.key === '_' || e.key === 'ArrowDown') setSens(sens - 3);
+  else if (e.key === 'ArrowRight' || e.key === ']') setFlow(flowRate * 1.25);
+  else if (e.key === 'ArrowLeft' || e.key === '[') setFlow(flowRate / 1.25);
+  else if (e.key === '.') setIce(iceBright + 0.05);
+  else if (e.key === ',') setIce(iceBright - 0.05);
+  else if (e.key === '0') { setSens(0); setFlow(1); setIce(ICE_DEFAULT); }
+  else return;
+  e.preventDefault();
+});
+// Sensitivity readout: shown for 3 s after a change, with the input level on the
+// scale the snowfall uses (left end: starts, right end: full).
+let osdUntil = 0;
+function setSens(v) {
+  sens = Math.max(-30, Math.min(30, v));
+  localStorage.setItem('pluto.sens', String(sens));
+  osdUntil = performance.now() + 3000;
+}
+let flowRate = +(localStorage.getItem('pluto.flow') || 1);
+function setFlow(v) {
+  flowRate = Math.max(0.1, Math.min(64, v));
+  if (Math.abs(flowRate - 1) < 0.03) flowRate = 1;
+  localStorage.setItem('pluto.flow', String(flowRate));
+  osdUntil = performance.now() + 3000;
+}
+const ICE_DEFAULT = 0.45;           // dim enough for a dark room
+let iceBright = +(localStorage.getItem('pluto.ice') || ICE_DEFAULT);
+function setIce(v) {
+  iceBright = Math.round(Math.max(0.05, Math.min(1, v)) * 100) / 100;
+  localStorage.setItem('pluto.ice', String(iceBright));
+  osdUntil = performance.now() + 3000;
+}
+const osd = document.getElementById('osd');
+setInterval(() => {
+  const on = performance.now() < osdUntil;
+  osd.classList.toggle('show', on);
+  if (!on) return;
+  const live = connected && performance.now() - lastFrame < 500;
+  const db = live ? rmsDb + sens : -120;
+  const frac = Math.min(1, Math.max(0, (db - LO_DB) / (HI_DB - LO_DB)));
+  document.getElementById('osdSens').textContent = (sens > 0 ? '+' : sens < 0 ? '−' : '±') + Math.abs(sens) + ' dB';
+  document.getElementById('osdFlow').textContent = '×' + (flowRate < 1 ? flowRate.toFixed(2) : flowRate.toFixed(1));
+  document.getElementById('osdIce').textContent = Math.round(iceBright * 100) + ' %';
+  document.getElementById('osdFill').style.width = (frac * 100).toFixed(1) + '%';
+  document.getElementById('osdIn').textContent = live
+    ? `input ${rmsDb.toFixed(1)} dBFS RMS → ${(frac * 100).toFixed(0)} % of full`
+    : 'no input from the JACK bridge';
+}, 100);
+let idleT;
+addEventListener('mousemove', () => {
+  document.body.classList.remove('idle');
+  clearTimeout(idleT); idleT = setTimeout(() => document.body.classList.add('idle'), 2000);
+});
+// Test hooks: ?level=0.5 pins the loudness (no audio needed); ?warm=N runs N sim steps
+// of 1/60 s on the first frame (settle the snow before a screenshot).
+{ const v = new URLSearchParams(location.search).get('level');
+  if (v !== null) { const L = +v; analyse = () => { level = L; }; panel.classList.add('hidden'); } }
+</script>
+</body>
+</html>

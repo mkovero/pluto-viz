@@ -1,0 +1,5 @@
+bridge/target/
+data/
+*.log
+brave-profile/
+__pycache__/
