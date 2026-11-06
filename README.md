@@ -124,8 +124,8 @@ microphone permission for the terminal. The downloaded binary is not signed: all
 
 ### From source
 
-Current stable Rust; on Linux the PipeWire and JACK headers and libclang (Debian/Ubuntu:
-`libpipewire-0.3-dev libjack-jackd2-dev libclang-dev`). The binary loads JACK at run time,
+Current stable Rust; on Linux the PipeWire, JACK and ALSA headers and libclang (Debian/Ubuntu:
+`libpipewire-0.3-dev libjack-jackd2-dev libasound2-dev libclang-dev`). The binary loads JACK at run time,
 so it starts on machines without it.
 
 ```sh

@@ -19,7 +19,7 @@ cargo clippy --manifest-path bridge/Cargo.toml --target x86_64-pc-windows-gnullv
 ```
 CI (`.github/workflows/ci.yml`): fmt, clippy, build, `--help` on Linux/Windows/macOS every push.
 Release (`release.yml`): a `v*` tag builds Linux x86_64, Windows x86_64, macOS arm64/x86_64 archives.
-Linux build deps: `libpipewire-0.3-dev libjack-jackd2-dev libclang-dev`.
+Linux build deps: `libpipewire-0.3-dev libjack-jackd2-dev libasound2-dev libclang-dev`.
 
 ## Bridge
 - Capture: Linux PipeWire via cpal (`pipewire` feature; default = the default sink's monitor) or JACK

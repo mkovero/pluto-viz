@@ -25,7 +25,7 @@ jobs:
           workspaces: bridge
       - name: JACK and PipeWire headers
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libjack-jackd2-dev libpipewire-0.3-dev libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y libjack-jackd2-dev libpipewire-0.3-dev libasound2-dev libclang-dev
       - run: cargo fmt --check
       - run: cargo clippy --release -- -D warnings
       - run: cargo build --release
